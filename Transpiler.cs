@@ -6,6 +6,13 @@ namespace TsTranspiler;
 public class Transpiler
 {
 
+    private static string outputDir = "";
+
+    /// <summary>
+    /// Full names of all the types being transpiled
+    /// </summary>
+    private static string[] typeNames;
+
     public static void Main(string[] args)
     {
         if (args.Length < 2)
@@ -14,9 +21,10 @@ public class Transpiler
             return;
         }
 
-        string dllPath = args[0], outputDir = args[1];
+        string dllPath = args[0];
+        outputDir = args[1];
 
-        FileInfo dllInfo = new FileInfo(dllPath);
+        FileInfo dllInfo = new(dllPath);
 
         if (!File.Exists(dllInfo.FullName))
         {
@@ -24,14 +32,33 @@ public class Transpiler
             return;
         }
 
-        Directory.CreateDirectory(outputDir);
-
         Assembly assembly = Assembly.LoadFile(dllInfo.FullName);
         Console.WriteLine($"Loaded assembly: {assembly.GetName().Name}. Finding types to transpile...");
-        Type[] types = assembly.GetTypes().Where(t => t.IsDefined(typeof(TranspileToTs))).ToArray();
+        Type[] types = assembly.GetTypes().Where(t => t.IsDefined(typeof(Transpile))).ToArray();
 
-        // Load third argument as number of threads
-        int threads = args.Length > 2 ? int.Parse(args[2]) : (int)MathF.Ceiling(types.Length / 20f);
+        // Read type names
+        typeNames = types.Select(t => t.FullName).ToArray();
+
+        int threads = (int)MathF.Ceiling(types.Length / 20f);
+
+        // Load other arguments
+        for (int i = 2; i < args.Length; i++)
+        {
+            string arg = args[i];
+            if (arg == "-t" || arg == "--threads")
+            {
+                threads = int.Parse(args[i + 1]);
+                i++;
+            }
+            else if (arg == "-d" || arg == "--delete-output-dir")
+            {
+                Console.WriteLine("Deleting output directory...");
+                Directory.Delete(outputDir, true);
+            }
+        }
+
+        // Set up folder
+        Directory.CreateDirectory(outputDir);
 
         Console.WriteLine($"Transpiling {types.Length} types using {threads} threads...");
 
@@ -45,7 +72,7 @@ public class Transpiler
         for (int i = 0; i < threads; i++)
         {
             Type[] typeChunk = typeChunks[i];
-            BetterTask task = new(() => TranspileTask(typeChunk, outputDir));
+            BetterTask task = new(() => TranspileTask(typeChunk));
             tasks[i] = task;
             task.Start();
         }
@@ -58,66 +85,111 @@ public class Transpiler
         Environment.Exit(0);
     }
 
-    private static void TranspileTask(Type[] types, string outputDir)
+    private static void TranspileTask(Type[] chunk)
     {
-        Console.WriteLine($"Started thread with {types.Length} types...");
+        Console.WriteLine($"Started thread with {chunk.Length} types...");
 
-        foreach (Type type in types)
-        {
-            TranspileType(type, outputDir);
-        }
+        foreach (Type type in chunk)
+            TranspileType(type);
     }
 
-    private static void TranspileType(Type type, string outputDir)
+    private static void TranspileType(Type type)
     {
         Console.WriteLine($"Transpiling type: {type.FullName}");
 
         // Convert namespace to directory path. Skip the first element to remove the assembly name
-        string[] ns = type.Namespace?.Split(".").Skip(1).ToArray() ?? [];
+        string dir = NamespaceToOutputDir(type.Namespace);
 
-        foreach (string dir in ns)
-        {
-            outputDir = Path.Combine(outputDir, dir);
-        }
-
-        Console.WriteLine($"Output directory: {outputDir}");
+        Console.WriteLine($"Output directory: {dir}");
 
         // Create directory if it doesn't exist
-        Directory.CreateDirectory(outputDir);
+        Directory.CreateDirectory(dir);
 
         // Write to file
         string ts = ConvertTypeToTs(type);
 
         Console.WriteLine($"Writing to file: {type.Name}.ts");
 
-        File.WriteAllText(Path.Combine(outputDir, type.Name + ".ts"), ts);
+        File.WriteAllText(Path.Combine(dir, type.Name + ".ts"), ts);
     }
 
     private static string ConvertTypeToTs(Type type)
     {
-        string ts = "interface " + type.Name + " {\n";
+        FieldInfo[] fields = type.GetFields();
+
+        List<string> imports = [];
+        string[] variableDeclarations = new string[fields.Length];
+
+        string[] typeNs = type.Namespace?.Split(".").Skip(1).ToArray() ?? [];
 
         // Add fields
-        FieldInfo[] fields = type.GetFields();
-        foreach (FieldInfo field in fields)
+        for (int i = 0; i < fields.Length; i++)
         {
-            ts += $"\t{field.Name}: {GetEquivalentType(field.FieldType)};\n";
+            FieldInfo field = fields[i];
+            Type fieldType = field.FieldType;
+            string tsType = GetEquivalentType(fieldType);
+
+            // Check if the type is an object and a type being transpiled
+            if (tsType == fieldType.Name && typeNames.Contains(fieldType.FullName))
+            {
+                // Convert namespace to directory path. Skip the first element to remove the assembly name
+                string[] ns = fieldType.Namespace?.Split(".").Skip(1).ToArray() ?? [];
+
+                // Find the relative path to the type
+                int commonLength = 0;
+                for (int j = 0; j < Math.Min(ns.Length, typeNs.Length); j++)
+                {
+                    if (ns[j] == typeNs[j]) commonLength++;
+                    else break;
+                }
+
+                string importPath = $"./";
+                for (int j = commonLength; j < typeNs.Length; j++)
+                    importPath += "../";
+
+                importPath += string.Join("/", ns);
+
+                if (ns.Any()) importPath += "/";
+                importPath += fieldType.Name;
+
+                imports.Add($"import {fieldType.Name} from '{importPath}';");
+            }
+
+            variableDeclarations[i] = $"{field.Name}: {tsType};";
         }
 
-        ts += "}\n\nexport default " + type.Name + ";";
+        // Generate file
+        string ts = imports.Any() ? string.Join("\n", imports) + "\n\n" : "";
+        ts += "interface " + type.Name + " {\n\t";
+        ts += string.Join("\n\t", variableDeclarations);
+        ts += "\n}\n\nexport default " + type.Name + ";";
 
         return ts;
     }
 
     private static string GetEquivalentType(Type type)
     {
-        return type.Name switch
+        // Check if the type is a nullable type
+        if (Nullable.GetUnderlyingType(type) == null)
         {
-            "Single" or "Double" or "Int16" or "Int32" or "Int64" or "UInt16" or "UInt32" or "UInt64" or "Byte" => "number",
-            "String" or "Char" => "string",
-            "Boolean" => "boolean",
-            _ => type.Name,
-        };
+            return type.Name switch
+            {
+                "Single" or "Double" or "Int16" or "Int32" or "Int64"
+                    or "UInt16" or "UInt32" or "UInt64" or "Byte" => "number",
+                "String" or "Char" => "string",
+                "Boolean" => "boolean",
+                _ => type.Name,
+            };
+        }
+
+        // Nullable type
+        return GetEquivalentType(Nullable.GetUnderlyingType(type)) + " | null";
+    }
+
+    private static string NamespaceToOutputDir(string? ns)
+    {
+        string[] nsArr = ns?.Split(".").Skip(1).ToArray() ?? [];
+        return Path.Combine(outputDir, Path.Combine(nsArr));
     }
 
 }
